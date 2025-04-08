@@ -8,6 +8,8 @@ import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.*;
 import java.nio.file.*;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -19,12 +21,14 @@ class VideoMessage implements Serializable {
     private final String filename;
     private final byte[] data;
     private final long timestamp;
+    private final String hash;
     
-    public VideoMessage(String filename, byte[] data) {
+    public VideoMessage(String filename, byte[] data) throws NoSuchAlgorithmException {
         this.id = UUID.randomUUID();
         this.filename = filename;
         this.data = data;
         this.timestamp = System.currentTimeMillis();
+        this.hash = computeHash(data);
     }
     
     public UUID getId() {
@@ -42,6 +46,16 @@ class VideoMessage implements Serializable {
     public long getTimestamp() {
         return timestamp;
     }
+
+    private String computeHash(byte[] data) throws NoSuchAlgorithmException {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] hashBytes = digest.digest(data);
+        return Base64.getEncoder().encodeToString(hashBytes);
+    }
+    
+    public String getHash() {
+        return hash;
+    }    
 }
 
 // ================ ConfigLoader class ================
@@ -182,7 +196,13 @@ class ProducerApp extends JFrame {
 
                 byte[] fileData = Files.readAllBytes(file.toPath());
 
-                VideoMessage videoMessage = new VideoMessage(file.getName(), fileData);
+                VideoMessage videoMessage;
+                try {
+                    videoMessage = new VideoMessage(file.getName(), fileData);
+                } catch (NoSuchAlgorithmException ex) {
+                    log("Hashing failed: " + ex.getMessage());
+                    return;
+                }
 
                 log("Connecting to server...");
                 try (Socket socket = new Socket(SERVER_HOST, SERVER_PORT);
@@ -221,6 +241,7 @@ class ConsumerApp extends JFrame {
     private static final long serialVersionUID = 1L;
     private static final int SERVER_PORT = 8888;
     private static final String UPLOAD_DIR = "uploads";
+    private final Set<String> receivedHashes = ConcurrentHashMap.newKeySet();
     
     private JPanel videoListPanel;
     private JLabel statusLabel;
@@ -316,10 +337,19 @@ class ConsumerApp extends JFrame {
             
             if (obj instanceof VideoMessage) {
                 VideoMessage videoMessage = (VideoMessage) obj;
+                String receivedHash = videoMessage.getHash();
                 log("Received video: " + videoMessage.getFilename());
-
+                
+                if (receivedHashes.contains(receivedHash)) {
+                    log("Duplicate video detected and ignored: " + videoMessage.getFilename());
+                    return;
+                }
+            
                 boolean added = videoQueue.offer(videoMessage);
-                if (!added) {
+                if (added) {
+                    receivedHashes.add(receivedHash);
+                    log("Video added to queue: " + videoMessage.getFilename());
+                } else {
                     log("Queue full, dropping video: " + videoMessage.getFilename());
                 }
             }
@@ -344,15 +374,44 @@ class ConsumerApp extends JFrame {
                 log("Thread " + threadId + " processing video: " + videoMessage.getFilename());
 
                 String filename = videoMessage.getId() + "_" + videoMessage.getFilename();
+                Path ffmpegPath = Paths.get("P3", "tools", "ffmpeg.exe").toAbsolutePath();
                 Path filePath = Paths.get(UPLOAD_DIR, filename);
+                Path tempPath = Paths.get(UPLOAD_DIR, "temp_" + filename);
                 
                 try (FileOutputStream fos = new FileOutputStream(filePath.toFile())) {
                     fos.write(videoMessage.getData());
                 }
+
+                /*try (FileOutputStream fos = new FileOutputStream(tempPath.toFile())) {
+                    fos.write(videoMessage.getData());
+                }
+
+                ProcessBuilder pbCompress = new ProcessBuilder(
+                    ffmpegPath.toString(),
+                    "-y", "-i", tempPath.toString(),
+                    "-vf", "scale=1280:720", "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "b:v", "500k",
+                    filePath.toString()
+                );
+                pbCompress.redirectErrorStream(true);
+                Process compressProcess = pbCompress.start();
+                compressProcess.waitFor();
+
+                Files.deleteIfExists(tempPath); */
+
+                Path previewPath = Paths.get(UPLOAD_DIR, "preview_" + filename);
+                ProcessBuilder pbPreview = new ProcessBuilder(ffmpegPath.toString(), "-y",
+                    "-i", filePath.toString(), "-ss", "0", "-t", "10",
+                    "-c", "copy", previewPath.toString());
+
+                pbPreview.redirectErrorStream(true);
+                Process previewProcess = pbPreview.start();
+                previewProcess.waitFor();
                 
                 log("Video saved: " + filePath);
 
-                SwingUtilities.invokeLater(() -> addVideoToUI(videoMessage, filePath));
+                SwingUtilities.invokeLater(() -> addVideoToUI(videoMessage, filePath, previewPath));
                 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -363,7 +422,7 @@ class ConsumerApp extends JFrame {
         }
     }
     
-    private void addVideoToUI(VideoMessage videoMessage, Path filePath) {
+    private void addVideoToUI(VideoMessage videoMessage, Path filePath, Path previewPath) {
         JPanel videoPanel = new JPanel(new BorderLayout());
         videoPanel.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(Color.GRAY),
@@ -380,6 +439,16 @@ class ConsumerApp extends JFrame {
             @Override
             public void mouseClicked(MouseEvent e) {
                 playVideo(filePath);
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                playVideo(previewPath);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e) {
+
             }
         });
         
