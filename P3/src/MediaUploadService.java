@@ -376,7 +376,7 @@ class ConsumerApp extends JFrame {
                 String filename = videoMessage.getId() + "_" + videoMessage.getFilename();
                 Path ffmpegPath = Paths.get("P3", "tools", "ffmpeg.exe").toAbsolutePath();
                 Path filePath = Paths.get(UPLOAD_DIR, filename);
-                Path tempPath = Paths.get(UPLOAD_DIR, "temp_" + filename);
+                //Path tempPath = Paths.get(UPLOAD_DIR, "temp_" + filename);
                 
                 try (FileOutputStream fos = new FileOutputStream(filePath.toFile())) {
                     fos.write(videoMessage.getData());
