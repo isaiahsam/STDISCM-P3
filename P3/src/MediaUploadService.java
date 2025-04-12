@@ -1,4 +1,4 @@
-// Pascual, Andres, Basco
+// Save this entire file as MediaUploadService.java in a single directory
 
 import javax.swing.*;
 import javax.swing.border.*;
@@ -23,12 +23,12 @@ class VideoMessage implements Serializable {
     private final long timestamp;
     private final String hash;
     
-    public VideoMessage(String filename, byte[] data) throws NoSuchAlgorithmException {
+    public VideoMessage(String filename, byte[] data) {
         this.id = UUID.randomUUID();
         this.filename = filename;
         this.data = data;
         this.timestamp = System.currentTimeMillis();
-        this.hash = computeHash(data);
+        this.hash = generateHash(data);
     }
     
     public UUID getId() {
@@ -46,16 +46,28 @@ class VideoMessage implements Serializable {
     public long getTimestamp() {
         return timestamp;
     }
-
-    private String computeHash(byte[] data) throws NoSuchAlgorithmException {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] hashBytes = digest.digest(data);
-        return Base64.getEncoder().encodeToString(hashBytes);
-    }
     
     public String getHash() {
         return hash;
-    }    
+    }
+    
+    private String generateHash(byte[] data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hashBytes = digest.digest(data);
+            
+            // Convert to hex string
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hashBytes) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return "hash-error-" + UUID.randomUUID().toString();
+        }
+    }
 }
 
 // ================ ConfigLoader class ================
@@ -103,10 +115,12 @@ class ProducerApp extends JFrame {
         setTitle("Video Producer");
         setSize(600, 400);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-
+        
+        // Initialize thread pool
         producerThreadPool = Executors.newFixedThreadPool(producerThreads);
         connectionChecker = Executors.newSingleThreadScheduledExecutor();
-
+        
+        // Set up UI
         JPanel mainPanel = new JPanel(new BorderLayout());
         
         JPanel topPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
@@ -126,8 +140,9 @@ class ProducerApp extends JFrame {
         mainPanel.add(topPanel, BorderLayout.NORTH);
         mainPanel.add(scrollPane, BorderLayout.CENTER);
         
+        // Add action listener to button
         selectFileButton.addActionListener(this::selectAndUploadFile);
-        selectFileButton.setEnabled(false); 
+        selectFileButton.setEnabled(false); // Disabled until server connection is confirmed
         
         add(mainPanel);
         setLocationRelativeTo(null);
@@ -193,30 +208,45 @@ class ProducerApp extends JFrame {
             try {
                 log("Reading file: " + file.getName());
                 SwingUtilities.invokeLater(() -> statusLabel.setText("Uploading: " + file.getName()));
-
+                
+                // Read file into byte array
                 byte[] fileData = Files.readAllBytes(file.toPath());
-
-                VideoMessage videoMessage;
-                try {
-                    videoMessage = new VideoMessage(file.getName(), fileData);
-                } catch (NoSuchAlgorithmException ex) {
-                    log("Hashing failed: " + ex.getMessage());
-                    return;
-                }
-
+                
+                // Create video message
+                VideoMessage videoMessage = new VideoMessage(file.getName(), fileData);
+                
+                // Connect to server and send video
                 log("Connecting to server...");
                 try (Socket socket = new Socket(SERVER_HOST, SERVER_PORT);
-                     ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream())) {
+                     ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
+                     ObjectInputStream ois = new ObjectInputStream(socket.getInputStream())) {
                     
                     log("Sending video: " + file.getName() + " (" + fileData.length / 1024 + " KB)");
                     oos.writeObject(videoMessage);
                     oos.flush();
                     
-                    log("Video sent successfully: " + file.getName());
-                    SwingUtilities.invokeLater(() -> statusLabel.setText("Upload complete: " + file.getName()));
+                    // Receive response from server
+                    String response = (String) ois.readObject();
+                    
+                    if (response.startsWith("SUCCESS")) {
+                        log("Video sent successfully: " + file.getName());
+                        SwingUtilities.invokeLater(() -> statusLabel.setText("Upload complete: " + file.getName()));
+                    } else if (response.startsWith("DUPLICATE")) {
+                        log("Duplicate file detected: " + file.getName());
+                        SwingUtilities.invokeLater(() -> {
+                            statusLabel.setText("Duplicate file not uploaded: " + file.getName());
+                            JOptionPane.showMessageDialog(null,
+                                "This file has already been uploaded.",
+                                "Duplicate File",
+                                JOptionPane.WARNING_MESSAGE);
+                        });
+                    } else {
+                        log("Upload failed: " + response);
+                        SwingUtilities.invokeLater(() -> statusLabel.setText("Upload failed"));
+                    }
                 }
                 
-            } catch (IOException ex) {
+            } catch (IOException | ClassNotFoundException ex) {
                 log("Error uploading file: " + ex.getMessage());
                 SwingUtilities.invokeLater(() -> statusLabel.setText("Upload failed"));
             }
@@ -241,7 +271,6 @@ class ConsumerApp extends JFrame {
     private static final long serialVersionUID = 1L;
     private static final int SERVER_PORT = 8888;
     private static final String UPLOAD_DIR = "uploads";
-    private final Set<String> receivedHashes = ConcurrentHashMap.newKeySet();
     
     private JPanel videoListPanel;
     private JLabel statusLabel;
@@ -252,20 +281,26 @@ class ConsumerApp extends JFrame {
     private ExecutorService serverThreadPool;
     private ServerSocket serverSocket;
     
+    // Add a set to track already uploaded file hashes
+    private Set<String> fileHashes = Collections.synchronizedSet(new HashSet<>());
+    
     public ConsumerApp(int consumerThreads, int queueSize) {
         setTitle("Video Consumer");
         setSize(800, 600);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-
+        
+        // Initialize queue and thread pools
         videoQueue = new ArrayBlockingQueue<>(queueSize);
         consumerThreadPool = Executors.newFixedThreadPool(consumerThreads);
         serverThreadPool = Executors.newSingleThreadExecutor();
-
+        
+        // Create uploads directory if it doesn't exist
         File uploadDir = new File(UPLOAD_DIR);
         if (!uploadDir.exists()) {
             uploadDir.mkdirs();
         }
-
+        
+        // Set up UI
         JPanel mainPanel = new JPanel(new BorderLayout());
         
         JPanel topPanel = new JPanel(new BorderLayout());
@@ -291,8 +326,10 @@ class ConsumerApp extends JFrame {
         add(mainPanel);
         setLocationRelativeTo(null);
         setVisible(true);
-
+        
+        // Start server to accept connections
         if (startServer()) {
+            // Start consumer threads
             for (int i = 0; i < consumerThreads; i++) {
                 final int threadId = i;
                 consumerThreadPool.submit(() -> processVideoQueue(threadId));
@@ -315,7 +352,8 @@ class ConsumerApp extends JFrame {
                     try {
                         Socket clientSocket = serverSocket.accept();
                         log("Client connected: " + clientSocket.getInetAddress());
-
+                        
+                        // Handle client in a separate thread
                         new Thread(() -> handleClient(clientSocket)).start();
                     } catch (IOException e) {
                         if (!serverSocket.isClosed()) {
@@ -332,26 +370,34 @@ class ConsumerApp extends JFrame {
     }
     
     private void handleClient(Socket clientSocket) {
-        try (ObjectInputStream ois = new ObjectInputStream(clientSocket.getInputStream())) {
+        try (ObjectInputStream ois = new ObjectInputStream(clientSocket.getInputStream());
+             ObjectOutputStream oos = new ObjectOutputStream(clientSocket.getOutputStream())) {
+            
             Object obj = ois.readObject();
             
             if (obj instanceof VideoMessage) {
                 VideoMessage videoMessage = (VideoMessage) obj;
-                String receivedHash = videoMessage.getHash();
                 log("Received video: " + videoMessage.getFilename());
                 
-                if (receivedHashes.contains(receivedHash)) {
-                    log("Duplicate video detected and ignored: " + videoMessage.getFilename());
+                // Check if this file hash already exists
+                if (fileHashes.contains(videoMessage.getHash())) {
+                    log("Duplicate video detected: " + videoMessage.getFilename());
+                    oos.writeObject("DUPLICATE: File already exists");
+                    oos.flush();
                     return;
                 }
-            
+                
+                // Not a duplicate, add to queue
                 boolean added = videoQueue.offer(videoMessage);
                 if (added) {
-                    receivedHashes.add(receivedHash);
-                    log("Video added to queue: " + videoMessage.getFilename());
+                    // Add hash to the set of known files
+                    fileHashes.add(videoMessage.getHash());
+                    oos.writeObject("SUCCESS: File queued for processing");
                 } else {
                     log("Queue full, dropping video: " + videoMessage.getFilename());
+                    oos.writeObject("ERROR: Queue full, please try again later");
                 }
+                oos.flush();
             }
             
         } catch (IOException | ClassNotFoundException e) {
@@ -372,46 +418,19 @@ class ConsumerApp extends JFrame {
             try {
                 VideoMessage videoMessage = videoQueue.take();
                 log("Thread " + threadId + " processing video: " + videoMessage.getFilename());
-
+                
+                // Save video file
                 String filename = videoMessage.getId() + "_" + videoMessage.getFilename();
-                Path ffmpegPath = Paths.get("P3", "tools", "ffmpeg.exe").toAbsolutePath();
                 Path filePath = Paths.get(UPLOAD_DIR, filename);
-                //Path tempPath = Paths.get(UPLOAD_DIR, "temp_" + filename);
                 
                 try (FileOutputStream fos = new FileOutputStream(filePath.toFile())) {
                     fos.write(videoMessage.getData());
                 }
-
-                /*try (FileOutputStream fos = new FileOutputStream(tempPath.toFile())) {
-                    fos.write(videoMessage.getData());
-                }
-
-                ProcessBuilder pbCompress = new ProcessBuilder(
-                    ffmpegPath.toString(),
-                    "-y", "-i", tempPath.toString(),
-                    "-vf", "scale=1280:720", "-c:v", "libx264",
-                    "-preset", "veryfast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k", "b:v", "500k",
-                    filePath.toString()
-                );
-                pbCompress.redirectErrorStream(true);
-                Process compressProcess = pbCompress.start();
-                compressProcess.waitFor();
-
-                Files.deleteIfExists(tempPath); */
-
-                Path previewPath = Paths.get(UPLOAD_DIR, "preview_" + filename);
-                ProcessBuilder pbPreview = new ProcessBuilder(ffmpegPath.toString(), "-y",
-                    "-i", filePath.toString(), "-ss", "0", "-t", "10",
-                    "-c", "copy", previewPath.toString());
-
-                pbPreview.redirectErrorStream(true);
-                Process previewProcess = pbPreview.start();
-                previewProcess.waitFor();
                 
                 log("Video saved: " + filePath);
-
-                SwingUtilities.invokeLater(() -> addVideoToUI(videoMessage, filePath, previewPath));
+                
+                // Update UI
+                SwingUtilities.invokeLater(() -> addVideoToUI(videoMessage, filePath));
                 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -422,38 +441,32 @@ class ConsumerApp extends JFrame {
         }
     }
     
-    private void addVideoToUI(VideoMessage videoMessage, Path filePath, Path previewPath) {
+    private void addVideoToUI(VideoMessage videoMessage, Path filePath) {
         JPanel videoPanel = new JPanel(new BorderLayout());
         videoPanel.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(Color.GRAY),
                 new EmptyBorder(10, 10, 10, 10)));
-
+        
+        // Create thumbnail/info panel
         JLabel thumbnailLabel = new JLabel(videoMessage.getFilename());
         thumbnailLabel.setIcon(new ImageIcon(createDefaultThumbnail()));
         thumbnailLabel.setHorizontalTextPosition(JLabel.CENTER);
         thumbnailLabel.setVerticalTextPosition(JLabel.BOTTOM);
-
+        
+        // Add tooltip for preview info (actual preview would require video processing library)
         thumbnailLabel.setToolTipText("Hover to preview (first 10 seconds)");
         
+        // Add click handler to "play" video
         thumbnailLabel.addMouseListener(new MouseAdapter() {
             @Override
             public void mouseClicked(MouseEvent e) {
                 playVideo(filePath);
             }
-
-            @Override
-            public void mouseEntered(MouseEvent e) {
-                playVideo(previewPath);
-            }
-
-            @Override
-            public void mouseExited(MouseEvent e) {
-
-            }
         });
         
         videoPanel.add(thumbnailLabel, BorderLayout.CENTER);
         
+        // Add to list with some space
         videoListPanel.add(Box.createRigidArea(new Dimension(0, 10)));
         videoListPanel.add(videoPanel);
         videoListPanel.revalidate();
@@ -461,6 +474,7 @@ class ConsumerApp extends JFrame {
     }
     
     private Image createDefaultThumbnail() {
+        // Create a simple placeholder thumbnail
         BufferedImage thumbnail = new BufferedImage(160, 120, BufferedImage.TYPE_INT_RGB);
         Graphics2D g2d = thumbnail.createGraphics();
         g2d.setColor(Color.BLACK);
@@ -474,6 +488,8 @@ class ConsumerApp extends JFrame {
     private void playVideo(Path filePath) {
         log("Playing video: " + filePath);
         
+        // In a real application, you would use a media player library
+        // For this example, we'll just try to open the file with the default system application
         try {
             Desktop.getDesktop().open(filePath.toFile());
         } catch (IOException e) {
@@ -511,6 +527,7 @@ public class MediaUploadService {
     private static ConsumerApp consumerApp;
     
     public static void main(String[] args) {
+        // Create config.txt if it doesn't exist
         File configFile = new File("config.txt");
         if (!configFile.exists()) {
             try (PrintWriter writer = new PrintWriter(configFile)) {
@@ -524,25 +541,32 @@ public class MediaUploadService {
         
         SwingUtilities.invokeLater(() -> {
             try {
+                // Load configuration
                 Map<String, Integer> config = ConfigLoader.loadConfig("config.txt");
                 int producerThreads = config.getOrDefault("p", 3);
                 int consumerThreads = config.getOrDefault("c", 2);
                 int queueSize = config.getOrDefault("q", 5);
                 
+                // Start both consumer and producer
                 consumerApp = new ConsumerApp(consumerThreads, queueSize);
                 
+                // Position the consumer window
                 consumerApp.setLocation(50, 50);
                 
+                // Short delay to ensure consumer starts first
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
                 
+                // Start producer
                 producerApp = new ProducerApp(producerThreads);
                 
+                // Position the producer window
                 producerApp.setLocation(consumerApp.getX() + consumerApp.getWidth() + 20, 50);
                 
+                // Add shutdown hook to clean up resources
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                     if (producerApp != null) producerApp.shutdown();
                     if (consumerApp != null) consumerApp.shutdown();
@@ -551,6 +575,7 @@ public class MediaUploadService {
             } catch (IOException e) {
                 System.err.println("Failed to load configuration: " + e.getMessage());
                 
+                // Use default values
                 consumerApp = new ConsumerApp(2, 5);
                 consumerApp.setLocation(50, 50);
                 
